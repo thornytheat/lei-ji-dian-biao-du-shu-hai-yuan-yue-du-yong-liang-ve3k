@@ -1,0 +1,32 @@
+{
+  "meters": [
+    {
+      "meter_id": "EM-01",
+      "name": "1 号楼照明总表",
+      "location": "1 号楼配电间",
+      "full_scale": 99999.9,
+      "ct_ratio": 1.0
+    },
+    {
+      "meter_id": "EM-02",
+      "name": "2 号楼动力总表",
+      "location": "2 号楼低压柜",
+      "full_scale": 99999.9,
+      "ct_ratio": 1.0
+    },
+    {
+      "meter_id": "EM-03",
+      "name": "3 号楼中央空调表",
+      "location": "3 号楼冷冻机房",
+      "full_scale": 99999.9,
+      "ct_ratio": 1.0
+    },
+    {
+      "meter_id": "EM-04",
+      "name": "4 号楼综合表",
+      "location": "4 号楼配电间",
+      "full_scale": 99999.9,
+      "ct_ratio": 1.0
+    }
+  ]
+}

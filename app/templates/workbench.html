@@ -1,0 +1,388 @@
+{% extends "base.html" %}
+{% block title %}还原工作台 · {{ app_name }}{% endblock %}
+{% block crumb %}还原工作台{% endblock %}
+{% block meta %}<span class="dot {{ 'warn' if ledger_stats.get('gaps', 0) or ledger_stats.get('isolated_anomalies', 0) else 'ok' }}"></span>
+读数 {{ readings_rows }} 行 · {{ meters | length }} 块表 · 默认月份 {{ default_month }}{% endblock %}
+{% block actions %}
+<button type="submit" form="run-form" class="btn small" id="run-submit-top">执行还原</button>
+<a class="btn secondary small" href="/review">月度台账与复核</a>
+{% endblock %}
+{% block status_left %}量程 {{ full_scale | num1 }} · 缺口阈值 {{ max_gap_days }} 天 · 峰谷容差 {{ (tou_tolerance * 100) | round(1) }}% · 分摊用最大余数法保证守恒{% endblock %}
+{% block status_right %}{{ app_name }} · 样例版本 {{ seed_result.seed_version if seed_result else '—' }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">还原工作台</h1>
+    <p class="page-sub">选月份 → 勾表 → 执行还原：左侧任务参数固定可见、导入入口与执行按钮常驻；右侧立即给出即时指标、还原结果预览与操作流水。数字全部有依据，异常区间隔离后不参与汇总。</p>
+  </div>
+</div>
+
+<div class="split">
+  <section class="panel pane-sticky" id="m1" style="max-height:calc(100vh - 206px)">
+    <div class="panel-head">
+      <h2>还原任务</h2>
+      <div class="panel-actions"><span class="tag">4 项输入</span></div>
+    </div>
+    <div class="panel-body">
+      <form id="run-form" data-endpoint="/api/restore">
+        <div class="field">
+          <label for="month">还原月份</label>
+          <select id="month" name="month">
+            {% for m in months %}
+            <option value="{{ m }}" {{ 'selected' if m == default_month else '' }}>{{ m }}</option>
+            {% endfor %}
+            {% if not months %}<option value="2026-03" selected>2026-03</option>{% endif %}
+          </select>
+        </div>
+
+        <div class="field">
+          <label>参与还原的表（默认全选）</label>
+          <div class="checklist">
+            {% for meter in meters %}
+            <label class="check">
+              <input type="checkbox" name="meter_ids" value="{{ meter.meter_id }}" checked>
+              <span>{{ meter.meter_id }} · {{ meter.name }}</span>
+              <span class="muted small">{{ meter.location }} · 量程 {{ meter.full_scale | num1 }}</span>
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="form-inline">
+          <div class="field">
+            <label for="full_scale">量程（回绕还原用）</label>
+            <input type="number" id="full_scale" name="full_scale" step="0.1" min="1" value="{{ full_scale }}">
+          </div>
+          <div class="field">
+            <label for="max_gap_days">缺口阈值（天，&gt; 该值即缺口）</label>
+            <input type="number" id="max_gap_days" name="max_gap_days" step="1" min="2" value="{{ max_gap_days }}">
+          </div>
+        </div>
+        <p class="small muted" style="margin:0">
+          当前库 <strong>{{ readings_rows }}</strong> 行读数 · {{ meters | length }} 块表 · 换表记录 {{ changes_count }} 条。
+        </p>
+      </form>
+
+      <div class="panel-body flush" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)">
+        <form id="import-form" data-endpoint="/api/import" enctype="multipart/form-data">
+          <div class="field">
+            <label for="file">读数导入：上传读数 CSV（UTF-8 / GBK）</label>
+            <input type="file" id="file" name="file" accept=".csv,text/csv">
+          </div>
+          <p style="margin:0 0 6px">
+            <button type="submit" class="secondary small">导入并校验</button>
+            <button type="button" class="secondary small" id="reimport-sample">重新导入样例（幂等）</button>
+          </p>
+        </form>
+        <div class="alert alert-error" id="import-error" hidden></div>
+        <div class="alert alert-info" id="import-notice" hidden></div>
+      </div>
+
+      <div class="alert alert-error" id="run-error" hidden></div>
+
+      <div id="progress" hidden>
+        <h3>执行进度</h3>
+        <ol class="progress" id="progress-steps"></ol>
+      </div>
+
+      <details class="help" style="margin-top:10px">
+        <summary>还原规则与口径（量程 / 缺口 / 分摊 / 分时）</summary>
+        <ul class="list small" style="margin-bottom:0">
+          <li><strong>默认参数</strong>：量程 <code>{{ full_scale | num1 }}</code> kWh、缺口阈值 <code>{{ max_gap_days }}</code> 天、峰谷容差 <code>{{ (tou_tolerance * 100) | round(1) }}%</code>，均可在左侧覆盖。</li>
+          <li><strong>读数 CSV 列契约</strong>：<code>meter_id,read_at,reading_kwh,kind</code>；<code>read_at</code> 为 ISO 日期，<code>kind</code> 只取 total / peak / valley。任意一行不合法即整体拒绝并给出行号、列名与原因。</li>
+          <li><strong>区间用量</strong>：<code>usage = 后读数 − 前读数</code>；后 &lt; 前时先看换表记录，再看回绕。</li>
+          <li><strong>换表分段</strong>：旧表尾段 = 拆表读数 − 前读数，新表首段 = 后读数 − 装表读数，两段相加为该区间用量。</li>
+          <li><strong>回绕还原</strong>：前读数 &ge; 量程 × 0.8 且 后读数 &le; 量程 × 0.2 → <code>量程 − 前读数 + 后读数</code>。</li>
+          <li><strong>无法判定</strong>：两者都不成立或换表记录与读数不自洽 → 隔离为异常，区间用量置空，不参与汇总。</li>
+          <li><strong>月度分摊</strong>：<code>[起始读数日, 结束读数日)</code> 按日历月切桶，份额 = 区间用量 × 该月天数 / 区间总天数，以「分」为单位用最大余数法分配，合计与区间用量完全相等。</li>
+          <li><strong>分时校验</strong>：<code>|peak + valley − total| &le; 0.5% × total</code>，超差记异常但仍输出数值。</li>
+        </ul>
+      </details>
+    </div>
+    <div class="panel-actions">
+      <button type="submit" form="run-form" id="run-submit">执行还原</button>
+      <a class="btn secondary small" href="/review">月度台账</a>
+    </div>
+  </section>
+
+  <div>
+    <div class="kpi-strip" id="wb-metrics">
+      <div class="kpi">
+        <div class="k-label">读数行数</div>
+        <div class="k-value">{{ readings_rows }}</div>
+        <div class="k-note">total + peak + valley</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">参与表</div>
+        <div class="k-value">{{ meters | length }}</div>
+        <div class="k-note">换表记录 {{ changes_count }} 条</div>
+      </div>
+      <div class="kpi {{ 'warn' if ledger_stats.get('gaps', 0) else 'ok' }}">
+        <div class="k-label">缺口段</div>
+        <div class="k-value">{{ ledger_stats.get('gaps', 0) }}</div>
+        <div class="k-note">间隔 &gt; {{ max_gap_days }} 天，不插值</div>
+      </div>
+      <div class="kpi {{ 'err' if ledger_stats.get('isolated_anomalies', 0) else 'ok' }}">
+        <div class="k-label">隔离异常</div>
+        <div class="k-value">{{ ledger_stats.get('isolated_anomalies', 0) }}</div>
+        <div class="k-note">读数回退且无换表记录</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">全期用量</div>
+        <div class="k-value">{{ ledger_stats.get('usage_total', 0) | num1 }}</div>
+        <div class="k-note">kWh · {{ ledger_stats.get('months', 0) }} 个月</div>
+      </div>
+    </div>
+
+    <section class="panel" id="m3">
+      <div class="panel-head">
+        <h2>还原结果预览</h2>
+        <div class="panel-actions">
+          <span class="tag">用量还原</span>
+          {% if runs %}<a class="btn secondary small" href="/result/{{ runs[0].run_id }}">最近批次结果</a>{% endif %}
+        </div>
+      </div>
+      <div class="panel-body" id="run-empty">
+        <div class="empty" style="padding:22px 12px">
+          <strong>还没有执行本次还原</strong>
+          左侧选好月份与表，点底部「执行还原」；跑完这里立即给出本月总用量、每表 total/peak/valley 与结果页入口。
+        </div>
+        {% if runs %}
+        <div class="table-wrap auto">
+          <table class="dense">
+            <thead><tr><th>最近批次</th><th>月份</th><th class="num">表数</th><th>执行时间</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>{{ runs[0].run_id }}</code></td>
+                <td>{{ runs[0].month }}</td>
+                <td class="num">{{ runs[0].meters | length }}</td>
+                <td class="small muted">{{ runs[0].created_at }}</td>
+                <td><a href="/result/{{ runs[0].run_id }}">打开结果页</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        {% endif %}
+      </div>
+      <div id="run-result" hidden>
+        <div class="panel-body tight">
+          <div class="kpi-strip" id="run-metrics"></div>
+          <div class="table-wrap">
+            <table class="dense" id="run-rows"></table>
+          </div>
+        </div>
+        <div class="panel-actions" id="run-links" hidden></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>换表 / 回绕识别与分摊口径</h2>
+        <div class="panel-actions"><span class="tag">{{ ledger_stats.get('meter_changes', 0) }} 次换表 · {{ ledger_stats.get('rollovers', 0) }} 次回绕</span></div>
+      </div>
+      <div class="panel-body tight">
+        <div id="m2">
+          <h3>换表识别</h3>
+          <p class="small" style="margin-top:2px">
+            样例含 <strong>{{ changes_count }}</strong> 条换表记录（EM-02 于 2025-09-15 轮换，拆表/装表读数按 total/peak/valley 分别登记）。
+            后读数 &lt; 前读数时先按换表记录分两段求和；换表记录与读数不自洽时该区间同样被隔离（不参与汇总）。
+          </p>
+          <p class="small muted" style="margin:0">
+            回绕：前读数 &ge; 量程 × 0.8 且 后读数 &le; 量程 × 0.2 → <code>量程 − 前读数 + 后读数</code>。数据期内共
+            <strong>{{ ledger_stats.get('meter_changes', 0) }}</strong> 次换表分段、<strong>{{ ledger_stats.get('rollovers', 0) }}</strong> 次满量程回绕。
+          </p>
+        </div>
+        <div id="m4" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
+          <h3>月度分摊</h3>
+          <p class="small" style="margin:0">
+            分摊公式：<code>本月分摊 = 区间用量 × 本月天数 / 区间总天数</code>；以「分」为整数单位做最大余数法分配，
+            <code>sum(分摊) == round(区间用量, 2)</code>，尾差落在余数最大的月份。跨月区间在结果页写明「本月分摊 + 26/35 天」这类依据，合计与区间用量守恒（误差 0）。
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>操作流水</h2>
+        <div class="panel-actions"><span class="tag">{{ events | length }} 条</span></div>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>时间</th><th>动作</th><th>说明</th></tr></thead>
+          <tbody>
+          {% for event in events %}
+            <tr>
+              <td class="small muted nowrap">{{ event.at }}</td>
+              <td><span class="tag">{{ event.kind }}</span></td>
+              <td class="small">{{ event.summary }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="3" class="muted">暂无流水。</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var form = document.getElementById('run-form');
+  var errorBox = document.getElementById('run-error');
+  var progress = document.getElementById('progress');
+  var stepsHost = document.getElementById('progress-steps');
+  var resultBox = document.getElementById('run-result');
+  var emptyBox = document.getElementById('run-empty');
+  var linksBox = document.getElementById('run-links');
+  var importForm = document.getElementById('import-form');
+  var importError = document.getElementById('import-error');
+  var importNotice = document.getElementById('import-notice');
+  var STEPS = ['读数校验', '换表/回绕识别', '用量还原', '月度分摊', '分时校验', '台账生成'];
+  var submitButtons = Array.prototype.slice.call(document.querySelectorAll('button[type="submit"][form="run-form"]'));
+
+  function setBusy(busy) {
+    submitButtons.forEach(function (b) { b.disabled = busy; });
+  }
+
+  function renderSteps(done, active) {
+    stepsHost.innerHTML = '';
+    STEPS.forEach(function (name, index) {
+      var li = document.createElement('li');
+      li.textContent = name;
+      if (index < done) li.className = 'done';
+      else if (index === active) li.className = 'active';
+      stepsHost.appendChild(li);
+    });
+  }
+
+  function num(value) {
+    if (value === null || value === undefined) return '—';
+    return Number(value).toFixed(2);
+  }
+
+  function kpi(label, value, note, tone) {
+    var box = document.createElement('div');
+    box.className = 'kpi' + (tone ? ' ' + tone : '');
+    var l = document.createElement('div'); l.className = 'k-label'; l.textContent = label;
+    var v = document.createElement('div'); v.className = 'k-value'; v.textContent = value;
+    box.appendChild(l); box.appendChild(v);
+    if (note) { var n = document.createElement('div'); n.className = 'k-note'; n.textContent = note; box.appendChild(n); }
+    return box;
+  }
+
+  if (form) {
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      errorBox.hidden = true;
+      resultBox.hidden = true;
+      linksBox.hidden = true;
+      var meterIds = Array.prototype.slice
+        .call(form.querySelectorAll('input[name="meter_ids"]:checked'))
+        .map(function (input) { return input.value; });
+      var payload = {
+        month: form.querySelector('#month').value,
+        meter_ids: meterIds,
+        full_scale: Number(form.querySelector('#full_scale').value) || 99999.9,
+        max_gap_days: Number(form.querySelector('#max_gap_days').value) || 31
+      };
+      progress.hidden = false;
+      setBusy(true);
+      var step = 0;
+      renderSteps(0, 0);
+      var timer = setInterval(function () {
+        step = Math.min(step + 1, STEPS.length - 1);
+        renderSteps(step, step);
+      }, 220);
+
+      try {
+        var data = await window.postJSON(form.getAttribute('data-endpoint'), payload);
+        clearInterval(timer);
+        renderSteps(STEPS.length, -1);
+        progress.hidden = true;
+
+        var totals = data.totals || {};
+        var metrics = document.getElementById('run-metrics');
+        metrics.innerHTML = '';
+        metrics.appendChild(kpi('本月总用量 kWh', num(totals.usage_total), (totals.meters || 0) + ' 块表 · ' + (totals.intervals || 0) + ' 个区间'));
+        metrics.appendChild(kpi('参与还原的表', totals.meters || 0, '本次勾选 ' + (data.meters || []).join(' · ')));
+        metrics.appendChild(kpi('缺口段', totals.gap_segments || 0, '缺失 ' + (totals.gap_days || 0) + ' 天，不插值', (totals.gap_segments ? 'warn' : 'ok')));
+        metrics.appendChild(kpi('异常数', totals.anomaly_count || 0, '隔离 ' + (totals.anomalies || 0) + ' · 分时超差 ' + (totals.tou_flagged || 0), (totals.anomaly_count ? 'err' : 'ok')));
+
+        var rows = ['<thead><tr><th>表号</th><th class="num">总电量</th><th class="num">峰段</th><th class="num">谷段</th><th class="num">缺口天</th><th class="num">异常</th><th>状态</th></tr></thead><tbody>'];
+        (data.rows || []).forEach(function (row) {
+          rows.push('<tr><td>' + row.meter_id + '</td><td class="num">' + num(row.total) + '</td><td class="num">' + num(row.peak) +
+            '</td><td class="num">' + num(row.valley) + '</td><td class="num">' + row.gap_days + '</td><td class="num">' + row.anomaly_count +
+            '</td><td>' + row.status_label + '</td></tr>');
+        });
+        rows.push('</tbody>');
+        document.getElementById('run-rows').innerHTML = rows.join('');
+        linksBox.innerHTML = '<a class="btn small" href="' + data.result_url + '">打开结果页（含逐条依据）</a>' +
+          '<a class="btn secondary small" href="' + data.export_url + '">导出台账 CSV</a>' +
+          '<span class="small muted" style="align-self:center">批次 <code>' + data.run_id + '</code></span>';
+        linksBox.hidden = false;
+        if (emptyBox) emptyBox.hidden = true;
+        resultBox.hidden = false;
+      } catch (err) {
+        clearInterval(timer);
+        progress.hidden = true;
+        window.showError(errorBox, err);
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+
+  if (importForm) {
+    importForm.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      importError.hidden = true;
+      importNotice.hidden = true;
+      var fileInput = importForm.querySelector('#file');
+      if (!fileInput.files.length) {
+        importError.hidden = false;
+        importError.textContent = '请先选择读数 CSV 文件';
+        return;
+      }
+      var body = new FormData();
+      body.append('file', fileInput.files[0]);
+      try {
+        var res = await fetch(importForm.getAttribute('data-endpoint'), { method: 'POST', body: body });
+        var data = await res.json();
+        if (!res.ok) {
+          var msg = data.error || data.detail || ('导入失败：' + res.status);
+          if (data.problems && data.problems.length) {
+            msg += '；' + data.problems.map(function (p) { return '第' + p.line + '行 ' + p.field + ' ' + p.message; }).join('；');
+          }
+          throw new Error(msg);
+        }
+        importNotice.hidden = false;
+        importNotice.textContent = '导入成功：' + data.replaced_rows + ' 行，表 ' + data.stats.meters.join('、') +
+          '，覆盖 ' + data.stats.date_from + ' ~ ' + data.stats.date_to + '，请刷新页面查看新的月份列表。';
+      } catch (err) {
+        window.showError(importError, err);
+      }
+    });
+  }
+
+  var sampleBtn = document.getElementById('reimport-sample');
+  if (sampleBtn) {
+    sampleBtn.addEventListener('click', async function () {
+      importError.hidden = true;
+      importNotice.hidden = true;
+      try {
+        var data = await window.postJSON('/api/import/sample', {});
+        importNotice.hidden = false;
+        importNotice.textContent = '样例重新导入：' + data.reason + '（读数 ' + data.counts.readings + ' 行）';
+      } catch (err) {
+        window.showError(importError, err);
+      }
+    });
+  }
+})();
+</script>
+{% endblock %}

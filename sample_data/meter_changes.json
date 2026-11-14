@@ -1,0 +1,26 @@
+{
+  "changes": [
+    {
+      "meter_id": "EM-02",
+      "change_date": "2025-09-15",
+      "old_meter_no": "DDZY-2014-00417",
+      "new_meter_no": "DDZY-2025-01183",
+      "reason": "表计超期轮换（使用满 11 年）",
+      "operator": "园区能源组 抄表班",
+      "segments": {
+        "total": {
+          "old_final": 3430.8,
+          "new_initial": 0.0
+        },
+        "peak": {
+          "old_final": 2127.1,
+          "new_initial": 0.0
+        },
+        "valley": {
+          "old_final": 1303.7,
+          "new_initial": 0.0
+        }
+      }
+    }
+  ]
+}

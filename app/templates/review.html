@@ -1,0 +1,280 @@
+{% extends "base.html" %}
+{% block title %}月度台账与复核 · {{ app_name }}{% endblock %}
+{% block crumb %}月度台账与复核{% endblock %}
+{% block meta %}{% set stats = ledger.stats if ledger else {} %}
+<span class="dot {{ 'warn' if stats.get('review_items', 0) else 'ok' }}"></span>
+{{ months | length }} 个月 · {{ stats.get('meters', 0) }} 块表 · 复核项 {{ stats.get('review_items', 0) }} 条（P1 {{ stats.get('review_p1', 0) }}）
+{% endblock %}
+{% block actions %}
+<a class="btn small" href="/api/ledger.csv">导出全期台账 CSV</a>
+<a class="btn secondary small" href="/api/review.csv">导出复核清单 CSV</a>
+<a class="btn secondary small" href="/workbench">回工作台</a>
+{% endblock %}
+{% block status_left %}台账口径：区间用量按天数分摊到日历月，合计与区间用量守恒（误差 0）；异常区间隔离不计入{% endblock %}
+{% block status_right %}{{ app_name }} · 高亮月份 {{ focus_month or '—' }}{% endblock %}
+
+{% block content %}
+{% set stats = ledger.stats if ledger else {} %}
+{% set qmonth = request.query_params.get('month') %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">月度台账与复核</h1>
+    <p class="page-sub">
+      覆盖 {{ months | length }} 个月（{{ months[0] if months else '—' }} ~ {{ months[-1] if months else '—' }}）、
+      {{ stats.get('meters', 0) }} 块表、{{ stats.get('intervals', 0) }} 个读数区间。
+      按月份/表号筛选并搜索后导出 CSV；右侧固定「复核清单与建议」，看 P1/P2/P3 计数与逐类建议动作。
+    </p>
+  </div>
+  <div class="page-head-actions">
+    <a class="btn secondary small" href="/workbench">去执行还原</a>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="toolbar">
+    <select id="review-month" aria-label="按月份筛选">
+      <option value="">全部月份</option>
+      {% for m in months %}
+      <option value="{{ m }}" {{ 'selected' if m == qmonth else '' }}>{{ m }}</option>
+      {% endfor %}
+    </select>
+    <select id="review-meter" aria-label="按表号筛选">
+      <option value="">全部表号</option>
+      {% for meter in (ledger.monitored if ledger else []) %}
+      <option value="{{ meter.meter_id }}">{{ meter.meter_id }} · {{ meter.name }}</option>
+      {% endfor %}
+    </select>
+    <input type="search" id="review-search" placeholder="搜索表号 / 表名 / 状态" aria-label="搜索台账行" style="min-width:220px">
+    <span class="spacer"></span>
+    <span class="small muted" id="review-stat">共 {{ months | length * stats.get('meters', 0) }} 行</span>
+    <button type="button" class="btn secondary small" data-export-csv="ledger-table" data-export-name="metercalc-ledger-filtered.csv">导出 CSV</button>
+  </div>
+  <div class="table-wrap roomy">
+    <table class="dense" id="ledger-table">
+      <thead>
+        <tr>
+          <th>月份</th><th>表号</th><th>表名</th><th class="num">总电量</th><th class="num">峰段</th><th class="num">谷段</th>
+          <th class="num">峰谷合计</th><th class="num">偏差</th><th>分时校验</th><th class="num">缺口天数</th><th class="num">异常数</th><th>状态</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for month in months %}
+          {% for row in ledger.months[month].rows %}
+          <tr data-month="{{ month }}" data-meter="{{ row.meter_id }}" class="{{ 'row-current' if month == focus_month else '' }}">
+            <td class="nowrap">{{ month }}</td>
+            <td class="mono">{{ row.meter_id }}</td>
+            <td class="small">{{ row.meter_name }}</td>
+            <td class="num">{{ row.total | num1 }}</td>
+            <td class="num">{{ row.peak | num1 }}</td>
+            <td class="num">{{ row.valley | num1 }}</td>
+            <td class="num">{{ row.tou.sum | num1 }}</td>
+            <td class="num">{{ row.tou['diff'] | signed }}</td>
+            <td>
+              {% if row.tou.status == 'ok' %}<span class="tag ok">通过</span>
+              {% elif row.tou.status == 'mismatch' %}<span class="tag err">超差</span>
+              {% else %}<span class="tag warn">缺数据</span>{% endif %}
+            </td>
+            <td class="num">{{ row.gap_days }}</td>
+            <td class="num">{{ row.anomaly_count }}</td>
+            <td><span class="tag {{ 'err' if row.status == 'anomaly' else ('warn' if row.status in ['tou_mismatch', 'gap'] else 'ok') }}">{{ row.status_label }}</span></td>
+          </tr>
+          {% endfor %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="panel-actions">
+    <span class="small muted" style="align-self:center">
+      「异常数」= 隔离异常数 + 分时超差数；缺口天数按缺失天数与该月的重叠计算；高亮行为当前复核月份 <strong>{{ focus_month or '—' }}</strong>。
+    </span>
+  </div>
+</section>
+
+<section class="panel" id="m6">
+  <div class="panel-head">
+    <h2>复核清单（{{ review_items | length }} 条）</h2>
+    <div class="panel-actions">
+      <span class="tag {{ 'err' if stats.get('review_p1', 0) else '' }}">P1 {{ stats.get('review_p1', 0) }}</span>
+      <span class="tag {{ 'warn' if stats.get('review_p2', 0) else '' }}">P2 {{ stats.get('review_p2', 0) }}</span>
+      <span class="tag">P3 {{ stats.get('review_p3', 0) }}</span>
+      <a class="btn secondary small" href="/api/review.csv">导出</a>
+    </div>
+  </div>
+  <div class="table-wrap roomy">
+    <table class="dense" id="review-table">
+      <thead><tr><th>月份</th><th>级别</th><th>表号</th><th>类型</th><th>问题</th><th>建议动作</th><th>依据</th></tr></thead>
+      <tbody>
+        {% for item in review_items %}
+        <tr data-month="{{ item.month }}" data-level="{{ item.level }}">
+          <td class="nowrap">{{ item.month }}</td>
+          <td><span class="tag {{ 'err' if item.level == 'P1' else ('warn' if item.level == 'P2' else '') }}">{{ item.level_label }}</span></td>
+          <td class="mono nowrap">{{ item.meter_id }}</td>
+          <td class="small nowrap">{{ item.kind }}</td>
+          <td class="small">{{ item.summary }}</td>
+          <td class="small">{{ item.action }}</td>
+          <td class="small muted">{{ item.basis }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="muted">没有复核事项。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="panel-actions">
+    <span class="small muted" style="align-self:center">
+      P1 立即复核（读数可信度问题）· P2 本月内复核（抄表质量）· P3 确认留存（换表/回绕已还原，仅归档确认）。
+    </span>
+  </div>
+</section>
+
+<div class="split result">
+  <div>
+    <section class="panel" id="m5">
+      <div class="panel-head">
+        <h2>分时校验汇总（全期，容差 {{ (tou_tolerance * 100) | round(1) }}%）</h2>
+        <div class="panel-actions"><span class="tag">peak + valley ≈ total</span></div>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>月份</th><th>表号</th><th class="num">峰段</th><th class="num">谷段</th><th class="num">峰+谷</th><th class="num">总量</th><th class="num">偏差</th><th>结论</th></tr></thead>
+          <tbody>
+            {% set ns = namespace(mismatch=0, shown=0) %}
+            {% for month in months %}
+              {% for row in ledger.months[month].rows %}
+                {% if row.tou.status != 'ok' %}
+                {% set ns.shown = ns.shown + 1 %}
+                <tr>
+                  <td class="nowrap">{{ month }}</td>
+                  <td class="mono">{{ row.meter_id }}</td>
+                  <td class="num">{{ row.tou.peak | num1 }}</td>
+                  <td class="num">{{ row.tou.valley | num1 }}</td>
+                  <td class="num">{{ row.tou.sum | num1 }}</td>
+                  <td class="num">{{ row.tou.total | num1 }}</td>
+                  <td class="num">{{ row.tou['diff'] | signed }}{% if row.tou.deviation_ratio is not none %}（{{ row.tou.deviation_ratio | pct }}）{% endif %}</td>
+                  <td>
+                    {% if row.tou.status == 'mismatch' %}
+                      {% set ns.mismatch = ns.mismatch + 1 %}<span class="tag err">超差，已记异常</span>
+                    {% else %}<span class="tag warn">缺数据</span>{% endif %}
+                  </td>
+                </tr>
+                {% endif %}
+              {% endfor %}
+            {% endfor %}
+            {% if ns.shown == 0 %}
+            <tr><td colspan="8" class="muted">全期所有表所有月份的峰谷一致性都通过。</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">
+          超差不改数：数值照常输出并记入异常数，复核清单给 P1 项要求核对采集器分时段配置与峰段寄存器。
+        </span>
+      </div>
+    </section>
+
+    <details class="help" style="margin-top:12px">
+      <summary>还原批次与操作流水</summary>
+      <h3>还原批次</h3>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>批次</th><th>月份</th><th>表</th><th>时间</th></tr></thead>
+          <tbody>
+          {% for run in runs %}
+            <tr>
+              <td><a href="/result/{{ run.run_id }}"><code>{{ run.run_id }}</code></a></td>
+              <td>{{ run.month }}</td>
+              <td class="small">{{ run.meters | join(', ') }}</td>
+              <td class="muted small">{{ run.created_at }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="4" class="muted">还没有批次，去工作台执行一次还原。</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <h3>操作流水</h3>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>时间</th><th>动作</th><th>说明</th></tr></thead>
+          <tbody>
+          {% for event in events %}
+            <tr><td class="muted small nowrap">{{ event.at }}</td><td><span class="tag">{{ event.kind }}</span></td><td class="small">{{ event.summary }}</td></tr>
+          {% else %}
+            <tr><td colspan="3" class="muted">暂无流水。</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  </div>
+
+  <div>
+    <section class="panel pane-sticky">
+      <div class="panel-head">
+        <h2>复核清单与建议</h2>
+        <div class="panel-actions"><span class="tag {{ 'err' if stats.get('review_p1', 0) else 'ok' }}">{{ review_items | length }} 条</span></div>
+      </div>
+      <div class="panel-body tight">
+        <div class="kpi-strip" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:10px">
+          <div class="kpi {{ 'err' if stats.get('review_p1', 0) else 'ok' }}" style="padding:8px 10px">
+            <div class="k-label">P1</div><div class="k-value" style="font-size:17px">{{ stats.get('review_p1', 0) }}</div>
+            <div class="k-note">立即复核</div>
+          </div>
+          <div class="kpi {{ 'warn' if stats.get('review_p2', 0) else '' }}" style="padding:8px 10px">
+            <div class="k-label">P2</div><div class="k-value" style="font-size:17px">{{ stats.get('review_p2', 0) }}</div>
+            <div class="k-note">本月内</div>
+          </div>
+          <div class="kpi" style="padding:8px 10px">
+            <div class="k-label">P3</div><div class="k-value" style="font-size:17px">{{ stats.get('review_p3', 0) }}</div>
+            <div class="k-note">确认留存</div>
+          </div>
+        </div>
+
+        <h3>按类型的建议动作</h3>
+        <ul class="list small" style="margin-top:4px">
+          {% for kind, items in review_items | groupby('kind') %}
+          <li>
+            <strong>{{ kind }}</strong>（{{ items | length }} 条）：
+            {{ items[0].action }}
+            <div class="small muted">涉及 {{ items | map(attribute='meter_id') | unique | join(' · ') }} · 月份 {{ items | map(attribute='month') | unique | join(' / ') }}</div>
+          </li>
+          {% else %}
+          <li class="muted">本期没有复核事项，台账可直接归档。</li>
+          {% endfor %}
+        </ul>
+
+        <h3>异常与缺口</h3>
+        <div class="table-wrap auto">
+          <table class="dense">
+            <tbody>
+              <tr><th style="width:120px">全期用量</th><td class="num">{{ stats.get('usage_total', 0) | num1 }} kWh</td></tr>
+              <tr><th>读数区间</th><td class="num">{{ stats.get('intervals', 0) }} 个</td></tr>
+              <tr><th>缺口段数</th><td class="num">{{ stats.get('gaps', 0) }} 段（不插值）</td></tr>
+              <tr><th>隔离异常</th><td class="num">{{ stats.get('isolated_anomalies', 0) }} 条</td></tr>
+              <tr><th>换表 / 回绕</th><td class="num">{{ stats.get('meter_changes', 0) }} 次 / {{ stats.get('rollovers', 0) }} 次</td></tr>
+              <tr><th>缺口阈值</th><td class="num">{{ max_gap_days }} 天</td></tr>
+              <tr><th>峰谷容差</th><td class="num">{{ (tou_tolerance * 100) | round(1) }}%</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel-actions">
+        <a class="btn small" href="/api/review.csv">导出复核清单 CSV</a>
+        <a class="btn secondary small" href="/api/ledger.csv">全期台账 CSV</a>
+        <a class="btn secondary small" href="/workbench">回工作台重算</a>
+      </div>
+    </section>
+
+    <details class="help" style="margin-top:12px">
+      <summary>台账口径与导出口径（CSV 列说明）</summary>
+      <ul class="list small" style="margin-bottom:0">
+        <li><strong>月度台账</strong>：每表每月一行；总电量/峰段/谷段均为「区间用量按天数分摊到本月」的合计，分摊用最大余数法，合计与区间用量完全相等。</li>
+        <li><strong>异常数</strong>：隔离异常数 + 分时超差数。隔离区间用量为 null，不计入合计。</li>
+        <li><strong>缺口天数</strong>：相邻读数间隔 &gt; 31 天记为缺口，禁止插值；缺口区间只报区间与建议抄表日。</li>
+        <li><strong>CSV</strong>：全期台账 UTF-8 BOM，Excel 可直接打开；表头为中文业务列名（月份 / 表号 / 表名 / 总电量kWh …）。</li>
+      </ul>
+    </details>
+  </div>
+</div>
+{% endblock %}

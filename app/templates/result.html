@@ -1,0 +1,442 @@
+{% extends "base.html" %}
+{% block title %}{{ run.month if run else '' }} 还原结果 · {{ app_name }}{% endblock %}
+{% block crumb %}还原结果{% endblock %}
+{% block meta %}
+{% if run %}{% set totals = run.focus.totals %}
+<span class="dot {{ 'warn' if run.focus.review else 'ok' }}"></span>
+{{ run.month }} · 总用量 {{ totals.usage_total | num1 }} kWh · 复核项 {{ run.focus.review | length }} 条
+{% else %}<span class="dot err"></span>批次不存在{% endif %}
+{% endblock %}
+{% block actions %}
+{% if run %}
+<a class="btn secondary small" href="/review?month={{ run.month }}">月度台账与复核</a>
+<a class="btn small" href="/workbench">回工作台</a>
+{% else %}
+<a class="btn small" href="/workbench">回还原工作台</a>
+{% endif %}
+{% endblock %}
+
+{% block content %}
+{% if not run %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">批次不存在</h1>
+    <p class="page-sub">还原批次 <code>{{ run_id }}</code> 不存在，请回到<a href="/workbench">还原工作台</a>重新执行一次还原。</p>
+  </div>
+</div>
+{% else %}
+{% set focus = run.focus %}
+{% set totals = focus.totals %}
+
+<div class="page-head">
+  <div>
+    <h1 class="page-title">{{ run.month }} 月度用能还原结果</h1>
+    <p class="page-sub">
+      <strong>结论：</strong>
+      {% if focus.review %}
+      <span class="tag err">{{ focus.review | length }} 条需人工复核</span>
+      本月有 {{ focus.review | length }} 条需要人工复核的事项（P1 立即复核 / P2 本月内 / P3 确认留存），明细见「缺口与异常」页签；异常区间已隔离，未计入总用量。
+      {% else %}
+      <span class="tag ok">全部可判定</span>
+      本月未发现需要复核的事项：所有区间均可判定，峰谷一致性通过。
+      {% endif %}
+      <br>批次 <code>{{ run.run_id }}</code> · 执行于 {{ run.created_at }} ·
+      区间 {{ focus.month_start }} ~ {{ focus.month_end }} ·
+      量程 {{ run.full_scale | num1 }} kWh · 缺口阈值 {{ run.max_gap_days }} 天 ·
+      峰谷容差 {{ (run.tou_tolerance * 100) | round(1) }}%
+    </p>
+  </div>
+  <div class="page-head-actions">
+    <a class="btn secondary small" href="/workbench">回工作台</a>
+    <a class="btn small" href="/api/runs/{{ run.run_id }}/ledger.csv">导出台账 CSV</a>
+  </div>
+</div>
+
+<div class="kpi-strip">
+  <div class="kpi">
+    <div class="k-label">总用量</div>
+    <div class="k-value">{{ totals.usage_total | num1 }}</div>
+    <div class="k-note">kWh · {{ totals.intervals }} 个读数区间</div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">表数</div>
+    <div class="k-value">{{ totals.meters }}</div>
+    <div class="k-note">{{ run.selected | join(' · ') }}</div>
+  </div>
+  <div class="kpi {{ 'warn' if totals.gap_segments else 'ok' }}">
+    <div class="k-label">缺口</div>
+    <div class="k-value">{{ totals.gap_segments }}</div>
+    <div class="k-note">段 · 缺失 {{ totals.gap_days }} 天，不插值</div>
+  </div>
+  <div class="kpi {{ 'err' if totals.anomaly_count else 'ok' }}">
+    <div class="k-label">异常</div>
+    <div class="k-value">{{ totals.anomaly_count }}</div>
+    <div class="k-note">隔离 {{ totals.anomalies }} · 分时超差 {{ totals.tou_flagged }}</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">
+    <div class="segmented">
+      <button type="button" data-tab-target="tab-ledger" class="active">月度台账</button>
+      <button type="button" data-tab-target="tab-basis">分摊依据</button>
+      <button type="button" data-tab-target="tab-gap">缺口与异常</button>
+      <button type="button" data-tab-target="tab-tou">分时校验</button>
+    </div>
+    <div class="panel-actions">
+      <span class="tag">{{ totals.meters }} 表 · {{ totals.review_items }} 复核项</span>
+    </div>
+  </div>
+  <div class="panel-body flush">
+
+    <div id="tab-ledger" class="tab-panel">
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">
+          每表每月 total / peak / valley 均为「按区间分摊到本月的合计」，缺口天数与异常数逐表统计。
+          合计与区间用量守恒（最大余数法，误差 0）；隔离区间不产生用量。
+        </p>
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead>
+            <tr>
+              <th>表号</th><th>表名</th><th class="num">总电量 kWh</th><th class="num">峰段 kWh</th><th class="num">谷段 kWh</th>
+              <th class="num">峰谷合计</th><th class="num">偏差</th><th class="num">缺口天数</th><th class="num">异常数</th><th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in focus.rows %}
+            <tr>
+              <td><strong>{{ row.meter_id }}</strong></td>
+              <td>{{ row.meter_name }}</td>
+              <td class="num">{{ row.total | num1 }}</td>
+              <td class="num">{{ row.peak | num1 }}</td>
+              <td class="num">{{ row.valley | num1 }}</td>
+              <td class="num">{{ row.tou.sum | num1 }}</td>
+              <td class="num">{{ row.tou['diff'] | signed }}</td>
+              <td class="num">{{ row.gap_days }}</td>
+              <td class="num">{{ row.anomaly_count }}</td>
+              <td>
+                <span class="tag {{ 'err' if row.status == 'anomaly' else ('warn' if row.status in ['tou_mismatch', 'gap'] else 'ok') }}">{{ row.status_label }}</span>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+          <tfoot>
+            <tr>
+              <th colspan="2">合计</th>
+              <th class="num">{{ totals.usage_total | num1 }}</th>
+              <th class="num">{{ totals.peak_total | num1 }}</th>
+              <th class="num">{{ totals.valley_total | num1 }}</th>
+              <th class="num">{{ (totals.peak_total + totals.valley_total) | num1 }}</th>
+              <th colspan="3" class="muted small">{{ totals.intervals }} 个区间 · {{ totals.review_items }} 条复核项</th>
+              <th></th>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      <div class="panel-body tight">
+        <details class="meter-block">
+          <summary><strong>跨月一览（同批次全部 {{ run.month_order | length }} 个月 × {{ run.focus.rows | length }} 块表，点开核对）</strong></summary>
+          <div class="table-wrap auto">
+            <table class="dense">
+              <thead><tr><th>月份</th><th>表号</th><th class="num">总电量</th><th class="num">峰段</th><th class="num">谷段</th><th class="num">缺口天数</th><th class="num">异常数</th><th>状态</th></tr></thead>
+              <tbody>
+                {% for month in run.month_order %}
+                  {% for row in run.ledger[month] %}
+                  <tr class="{{ 'row-current' if month == run.month else '' }}">
+                    <td>{{ month }}</td>
+                    <td class="nowrap">{{ row.meter_id }}</td>
+                    <td class="num">{{ row.total | num1 }}</td>
+                    <td class="num">{{ row.peak | num1 }}</td>
+                    <td class="num">{{ row.valley | num1 }}</td>
+                    <td class="num">{{ row.gap_days }}</td>
+                    <td class="num">{{ row.anomaly_count }}</td>
+                    <td><span class="tag {{ 'err' if row.status == 'anomaly' else ('warn' if row.status in ['tou_mismatch', 'gap'] else 'ok') }}">{{ row.status_label }}</span></td>
+                  </tr>
+                  {% endfor %}
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <div id="tab-basis" class="tab-panel" hidden>
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">
+          每个区间都写明：前/后读数、区间用量与算式、跨月时的天数分摊（最大余数法，合计与区间用量完全相等）。
+          状态为「隔离」的区间不产生用量。
+        </p>
+      </div>
+
+      <div class="panel-body tight" style="border-top:1px solid var(--line)">
+        <h3>本月换表分段</h3>
+        {% if focus.changes %}
+        <div class="table-wrap auto">
+          <table class="dense">
+            <thead><tr><th>表号</th><th>区间</th><th class="num">区间用量</th><th>分段依据</th></tr></thead>
+            <tbody>
+              {% for change in focus.changes %}
+              <tr>
+                <td class="nowrap">{{ change.meter_id }}</td>
+                <td class="small nowrap">{{ change.start }} → {{ change.end }}</td>
+                <td class="num">{{ change.usage | num1 }}</td>
+                <td class="small">{{ change.formula }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="small muted" style="margin:0">本月没有换表分段。</p>
+        {% endif %}
+      </div>
+
+      <div class="panel-body tight" style="border-top:1px solid var(--line)">
+        <h3>本月回绕还原</h3>
+        {% if focus.rollovers %}
+        <div class="table-wrap auto">
+          <table class="dense">
+            <thead><tr><th>表号</th><th>区间</th><th class="num">回绕后用量</th><th>还原公式</th></tr></thead>
+            <tbody>
+              {% for rollover in focus.rollovers %}
+              <tr>
+                <td class="nowrap">{{ rollover.meter_id }}</td>
+                <td class="small nowrap">{{ rollover.start }} → {{ rollover.end }}</td>
+                <td class="num">{{ rollover.usage | num1 }}</td>
+                <td class="small">{{ rollover.formula }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="small muted" style="margin:0">本月没有满量程回绕。</p>
+        {% endif %}
+        {% if not focus.changes and not focus.rollovers %}
+        <p class="small muted" style="margin:6px 0 0">
+          数据期内共发生 <strong>{{ run.stats.meter_changes }}</strong> 次换表分段、
+          <strong>{{ run.stats.rollovers }}</strong> 次满量程回绕（EM-02 换表在 2025-09、EM-03 回绕在 2025-12，可在工作台选择对应月份复核）。
+        </p>
+        {% endif %}
+      </div>
+
+      <div class="panel-body tight" style="border-top:1px solid var(--line)">
+        <h3>逐条依据 · 总电量 total（区间起止 + 分摊公式）</h3>
+        <div class="table-wrap roomy">
+          <table class="dense">
+            <thead>
+              <tr><th>表号</th><th>区间起止</th><th class="num">天数</th><th class="num">前读数</th><th class="num">后读数</th><th class="num">区间用量</th><th class="num">本月分摊</th><th>判定与算式</th></tr>
+            </thead>
+            <tbody>
+              {% for group in focus.by_meter %}
+              {% for item in group.total_evidence %}
+              <tr class="{{ 'row-anomaly' if item.status == 'anomaly' else ('row-gap' if item.gap else '') }}">
+                <td class="mono nowrap">{{ group.row.meter_id }}</td>
+                <td class="small nowrap">{{ item.start }} → {{ item.end }}</td>
+                <td class="num">{{ item.days }}</td>
+                <td class="num">{{ item.prev_value | num1 }}</td>
+                <td class="num">{{ item.next_value | num1 }}</td>
+                <td class="num">{{ item.usage | num1 if item.usage is not none else '隔离' }}</td>
+                <td class="num">
+                  {{ item.month_share | num1 if item.month_share is not none else '—' }}
+                  {% if item.month_part_days is not none and item.month_part_days != item.days %}
+                  <div class="small muted">{{ item.month_part_days }}/{{ item.days }} 天</div>
+                  {% endif %}
+                </td>
+                <td class="small">
+                  <span class="tag {{ 'err' if item.status == 'anomaly' else ('warn' if item.gap else ('ok' if item.status == 'normal' else '')) }}">{{ item.status_label }}</span>
+                  {{ item.formula if item.formula else item.reason }}
+                  {% if item.status in ['meter_change', 'rollover'] and item.segments %}
+                  <ul class="list small">
+                    {% for seg in item.segments %}
+                    <li>{{ seg.meter_no }} {{ seg.from }} → {{ seg.to }}（{{ seg.days }} 天）：{{ seg.start_reading | num1 }} → {{ seg.end_reading | num1 }}，用量 {{ seg.usage | num1 }}</li>
+                    {% endfor %}
+                  </ul>
+                  {% endif %}
+                  {% if item.proration_formula and item.month_part_days is not none and item.month_part_days != item.days %}
+                  <div class="muted">{{ item.proration_formula }}</div>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <details class="help" style="margin-top:8px" open>
+          <summary>峰段 peak / 谷段 valley 逐条依据（同一套区间与分摊规则分别还原）</summary>
+          {% for group in focus.by_meter %}
+          {% for block in [
+              {'title': '峰段 peak', 'rows': group.peak_evidence},
+              {'title': '谷段 valley', 'rows': group.valley_evidence}
+            ] %}
+          <h3 style="margin-top:8px">{{ group.row.meter_id }} · {{ group.row.meter_name }} · {{ block.title }}（{{ block.rows | length }} 段）</h3>
+          <div class="table-wrap auto">
+            <table class="dense">
+              <thead>
+                <tr><th>区间起止</th><th class="num">天数</th><th class="num">前读数</th><th class="num">后读数</th><th class="num">区间用量</th><th class="num">本月分摊</th><th>判定与算式</th></tr>
+              </thead>
+              <tbody>
+                {% for item in block.rows %}
+                <tr class="{{ 'row-anomaly' if item.status == 'anomaly' else ('row-gap' if item.gap else '') }}">
+                  <td class="small nowrap">{{ item.start }} → {{ item.end }}</td>
+                  <td class="num">{{ item.days }}</td>
+                  <td class="num">{{ item.prev_value | num1 }}</td>
+                  <td class="num">{{ item.next_value | num1 }}</td>
+                  <td class="num">{{ item.usage | num1 if item.usage is not none else '隔离' }}</td>
+                  <td class="num">
+                    {{ item.month_share | num1 if item.month_share is not none else '—' }}
+                    {% if item.month_part_days is not none and item.month_part_days != item.days %}
+                    <div class="small muted">{{ item.month_part_days }}/{{ item.days }} 天</div>
+                    {% endif %}
+                  </td>
+                  <td class="small">
+                    <span class="tag {{ 'err' if item.status == 'anomaly' else ('warn' if item.gap else ('ok' if item.status == 'normal' else '')) }}">{{ item.status_label }}</span>
+                    {{ item.formula if item.formula else item.reason }}
+                    {% if item.proration_formula and item.month_part_days is not none and item.month_part_days != item.days %}
+                    <div class="muted">{{ item.proration_formula }}</div>
+                    {% endif %}
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% endfor %}
+          {% endfor %}
+          <p class="small muted" style="margin:6px 0 0">
+            三份依据在同一个月内相互校验：峰 + 谷 ≈ 总量（容差 0.5%），超差进复核清单但不改数。
+          </p>
+        </details>
+      </div>
+    </div>
+
+    <div id="tab-gap" class="tab-panel" hidden>
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">
+          抄表缺口只报区间与建议抄表日，<strong>禁止插值</strong>；无法判定的读数回退区间一律隔离，不参与合计。
+        </p>
+      </div>
+
+      <div class="panel-body tight" style="border-top:1px solid var(--line)">
+        <h3>抄表缺口（间隔 &gt; {{ run.max_gap_days }} 天，禁止插值）</h3>
+        {% if focus.gaps %}
+        <div class="table-wrap auto">
+          <table class="dense">
+            <thead><tr><th>表号</th><th>缺口区间</th><th class="num">间隔天数</th><th class="num">缺失天数</th><th class="num">本月影响</th><th>建议抄表日</th><th>说明</th></tr></thead>
+            <tbody>
+              {% for gap in focus.gaps %}
+              <tr>
+                <td class="nowrap">{{ gap.meter_id }}</td>
+                <td class="small nowrap">{{ gap.start }} → {{ gap.end }}</td>
+                <td class="num">{{ gap.span_days }}</td>
+                <td class="num">{{ gap.missing_days }}</td>
+                <td class="num">{{ gap.month_days }} 天</td>
+                <td><strong>{{ gap.suggested_read_at }}</strong></td>
+                <td class="small">{{ gap.note }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <p class="small muted" style="margin:6px 0 0">缺口期间没有任何读数，系统只用首尾真实读数做差并按天数分摊，<strong>不补任何插值点</strong>；缺口越大，日均值的参考意义越小。</p>
+        {% else %}
+        <p class="small muted" style="margin:0">本月没有 &gt; {{ run.max_gap_days }} 天的抄表缺口。</p>
+        {% endif %}
+      </div>
+
+      <div class="panel-body tight" style="border-top:1px solid var(--line)">
+        <h3>隔离异常（不参与汇总）</h3>
+        {% if focus.anomalies %}
+        <div class="table-wrap auto">
+          <table class="dense">
+            <thead><tr><th>表号</th><th>区间</th><th class="num">前读数</th><th class="num">后读数</th><th>涉及类型</th><th>判定结果</th></tr></thead>
+            <tbody>
+              {% for item in focus.anomalies %}
+              <tr>
+                <td class="nowrap">{{ item.meter_id }}</td>
+                <td class="small nowrap">{{ item.start }} → {{ item.end }}</td>
+                <td class="num">{{ item.prev_value | num1 }}</td>
+                <td class="num">{{ item.next_value | num1 }}</td>
+                <td class="small">{{ item.kinds | join(' / ') }}</td>
+                <td class="small">{{ item.reason }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <p class="small muted" style="margin:6px 0 0">隔离含义：该区间用量记为 null，不计入月度合计；表中数字因此可能略低于表码差，差额与上表区间一一对应。</p>
+        {% else %}
+        <p class="small muted" style="margin:0">本月没有无法判定的读数回退区间。</p>
+        {% endif %}
+      </div>
+
+      <div class="panel-body tight" style="border-top:1px solid var(--line)">
+        <h3>本月复核清单（{{ focus.review | length }} 条）</h3>
+        {% if focus.review %}
+        <div class="table-wrap roomy">
+          <table class="dense">
+            <thead><tr><th>级别</th><th>表号</th><th>类型</th><th>问题</th><th>建议动作</th><th>依据</th></tr></thead>
+            <tbody>
+              {% for item in focus.review %}
+              <tr>
+                <td><span class="tag {{ 'err' if item.level == 'P1' else ('warn' if item.level == 'P2' else '') }}">{{ item.level_label }}</span></td>
+                <td class="nowrap">{{ item.meter_id }}</td>
+                <td class="small nowrap">{{ item.kind }}</td>
+                <td class="small">{{ item.summary }}</td>
+                <td class="small">{{ item.action }}</td>
+                <td class="small muted">{{ item.basis }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="small muted" style="margin:0">本月无需复核的事项。</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <div id="tab-tou" class="tab-panel" hidden>
+      <div class="panel-body tight">
+        <h3 style="margin-top:0">分时一致性校验（peak + valley ≈ total，容差 0.5%）</h3>
+        <p class="small muted" style="margin:0">超差不改数：数值照常输出并记入异常数，复核清单里给 P1 项要求核对采集器分时段配置。</p>
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead><tr><th>表号</th><th class="num">峰段</th><th class="num">谷段</th><th class="num">峰+谷</th><th class="num">总量</th><th class="num">偏差</th><th class="num">容差</th><th>结论</th></tr></thead>
+          <tbody>
+            {% for row in focus.rows %}
+            <tr>
+              <td class="nowrap">{{ row.meter_id }}</td>
+              <td class="num">{{ row.tou.peak | num1 }}</td>
+              <td class="num">{{ row.tou.valley | num1 }}</td>
+              <td class="num">{{ row.tou.sum | num1 }}</td>
+              <td class="num">{{ row.tou.total | num1 }}</td>
+              <td class="num">{{ row.tou['diff'] | signed }}{% if row.tou.deviation_ratio is not none %}（{{ row.tou.deviation_ratio | pct }}）{% endif %}</td>
+              <td class="num">±{{ row.tou.allowed | num }}</td>
+              <td>
+                {% if row.tou.status == 'mismatch' %}
+                  <span class="tag err">超差，已记异常</span>
+                {% elif row.tou.status == 'ok' %}
+                  <span class="tag ok">通过</span>
+                {% else %}
+                  <span class="tag warn">缺数据</span>
+                {% endif %}
+              </td>
+            </tr>
+            <tr class="sub"><td colspan="8" class="small muted">{{ row.tou.note }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+{% endif %}
+{% endblock %}
