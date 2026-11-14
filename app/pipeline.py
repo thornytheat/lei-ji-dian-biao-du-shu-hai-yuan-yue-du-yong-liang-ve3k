@@ -30,6 +30,7 @@ def analyze(
     full_scale: float = settings.DEFAULT_FULL_SCALE,
     max_gap_days: int = settings.MAX_GAP_DAYS,
     tou_tolerance: float = settings.TOU_TOLERANCE,
+    only_months: list[str] | None = None,
 ) -> dict:
     if not rows:
         raise PipelineError("读数库为空，请先导入读数 CSV 或样例数据")
@@ -75,6 +76,11 @@ def analyze(
     )
     if not months:
         raise PipelineError("读数区间不足两个抄表点，无法还原任何月份用量")
+
+    # 补录重算：只构建受影响的月份，其余月份沿用旧版本快照，避免整批重算漂移。
+    if only_months is not None:
+        wanted = sorted({key for key in only_months if key})
+        months = [key for key in months if key in wanted]
 
     ledger = summary.build_ledger(
         months=months,

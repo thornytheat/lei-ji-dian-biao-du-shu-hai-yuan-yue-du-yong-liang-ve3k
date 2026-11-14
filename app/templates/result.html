@@ -40,15 +40,18 @@
       <span class="tag ok">全部可判定</span>
       本月未发现需要复核的事项：所有区间均可判定，峰谷一致性通过。
       {% endif %}
-      <br>批次 <code>{{ run.run_id }}</code> · 执行于 {{ run.created_at }} ·
+      <br>批次 <code>{{ run.run_id }}</code> · 版本 <code>{{ run.version_id or '—' }}</code>（第 {{ run.revision }} 版）· 执行于 {{ run.created_at }}
+      {% if run.updated_at and run.updated_at != run.created_at %} · 最近更新 {{ run.updated_at }}{% endif %} ·
       区间 {{ focus.month_start }} ~ {{ focus.month_end }} ·
       量程 {{ run.full_scale | num1 }} kWh · 缺口阈值 {{ run.max_gap_days }} 天 ·
       峰谷容差 {{ (run.tou_tolerance * 100) | round(1) }}%
+      {% if run.affected_months %} · 本次补录重算 {{ run.affected_months | join('、') }}{% endif %}
     </p>
   </div>
   <div class="page-head-actions">
     <a class="btn secondary small" href="/workbench">回工作台</a>
     <a class="btn small" href="/api/runs/{{ run.run_id }}/ledger.csv">导出台账 CSV</a>
+    <a class="btn secondary small" href="/api/runs/{{ run.run_id }}/versions">历史版本</a>
   </div>
 </div>
 
@@ -143,7 +146,7 @@
               <thead><tr><th>月份</th><th>表号</th><th class="num">总电量</th><th class="num">峰段</th><th class="num">谷段</th><th class="num">缺口天数</th><th class="num">异常数</th><th>状态</th></tr></thead>
               <tbody>
                 {% for month in run.month_order %}
-                  {% for row in run.ledger[month] %}
+                  {% for row in run.ledger[month].rows %}
                   <tr class="{{ 'row-current' if month == run.month else '' }}">
                     <td>{{ month }}</td>
                     <td class="nowrap">{{ row.meter_id }}</td>

@@ -81,6 +81,32 @@
 
       <div class="alert alert-error" id="run-error" hidden></div>
 
+      <div class="panel-body flush" id="correction-entry" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)">
+        <h3>补录 / 迟到更正</h3>
+        <p class="small muted" style="margin:0 0 8px">
+          对<strong>已发布批次</strong>补录迟到更正：整批先校验，只重算受影响月份，通过后一次性切换到新版本；
+          旧版本保留可回读。同一批重复提交不会新增结果。
+        </p>
+        <div class="field">
+          <label for="correction-run">补录目标批次</label>
+          <select id="correction-run">
+            {% for run in runs %}
+            <option value="{{ run.run_id }}" {{ 'selected' if loop.first else '' }}>{{ run.run_id }} · {{ run.month }} · 版本 v{{ run.revision }}</option>
+            {% endfor %}
+            {% if not runs %}<option value="">还没有发布批次，请先执行还原</option>{% endif %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="correction-rows">更正明细（每行 <code>meter_id,read_at,reading_kwh,kind</code>）</label>
+          <textarea id="correction-rows" rows="4" class="mono" placeholder="EM-01,2026-03-29,9700.0,total"></textarea>
+        </div>
+        <div class="alert alert-error" id="correction-error" hidden></div>
+        <div class="alert alert-info" id="correction-notice" hidden></div>
+        <p style="margin:0">
+          <button type="button" class="secondary small" id="correction-submit">校验并发布补录</button>
+        </p>
+      </div>
+
       <div id="progress" hidden>
         <h3>执行进度</h3>
         <ol class="progress" id="progress-steps"></ol>
@@ -380,6 +406,65 @@
         importNotice.textContent = '样例重新导入：' + data.reason + '（读数 ' + data.counts.readings + ' 行）';
       } catch (err) {
         window.showError(importError, err);
+      }
+    });
+  }
+
+  // 补录 / 迟到更正：整批校验 → 只重算受影响月份 → 原子发布新版本
+  var corrBtn = document.getElementById('correction-submit');
+  if (corrBtn) {
+    corrBtn.addEventListener('click', async function () {
+      var errorBox2 = document.getElementById('correction-error');
+      var noticeBox = document.getElementById('correction-notice');
+      var runSelect = document.getElementById('correction-run');
+      var textarea = document.getElementById('correction-rows');
+      errorBox2.hidden = true;
+      noticeBox.hidden = true;
+      var runId = runSelect.value;
+      if (!runId) { window.showError(errorBox2, new Error('还没有可补录的批次，请先执行还原')); return; }
+      var rows = [];
+      var problems = [];
+      textarea.value.split(/\r?\n/).forEach(function (line, index) {
+        var text = line.trim();
+        if (!text) return;
+        var parts = text.split(',');
+        if (parts.length !== 4) {
+          problems.push('第 ' + (index + 1) + ' 行：需要 4 列 meter_id,read_at,reading_kwh,kind');
+          return;
+        }
+        rows.push({
+          meter_id: parts[0].trim(),
+          read_at: parts[1].trim(),
+          reading_kwh: parts[2].trim(),
+          kind: parts[3].trim()
+        });
+      });
+      if (problems.length) {
+        errorBox2.hidden = false;
+        errorBox2.textContent = problems.join('；');
+        return;
+      }
+      if (!rows.length) { window.showError(errorBox2, new Error('请至少填写一条更正读数')); return; }
+      corrBtn.disabled = true;
+      try {
+        var data = await window.postJSON('/api/runs/' + encodeURIComponent(runId) + '/corrections', { readings: rows });
+        noticeBox.hidden = false;
+        var months = (data.affected_months || []).join('、') || '无';
+        noticeBox.textContent = (data.idempotent ? '该批补录已发布过，未新增结果：' : '补录已发布：') +
+          '版本 ' + data.version_id + '（第 ' + data.revision + ' 版），重算月份 ' + months +
+          '，其余 ' + (data.unchanged_months || []).length + ' 个月沿用旧版快照。';
+        var link = document.createElement('a');
+        link.href = data.result_url;
+        link.textContent = ' 打开结果页';
+        noticeBox.appendChild(link);
+        var resultWrap = document.getElementById('run-result');
+        if (resultWrap) resultWrap.hidden = true;
+        var emptyWrap = document.getElementById('run-empty');
+        if (emptyWrap) emptyWrap.hidden = false;
+      } catch (err) {
+        window.showError(errorBox2, err);
+      } finally {
+        corrBtn.disabled = false;
       }
     });
   }

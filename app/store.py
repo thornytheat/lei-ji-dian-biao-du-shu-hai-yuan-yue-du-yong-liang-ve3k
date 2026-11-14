@@ -42,7 +42,35 @@ CREATE TABLE IF NOT EXISTS runs (
     created_at TEXT NOT NULL,
     month      TEXT NOT NULL,
     meters     TEXT NOT NULL,
-    payload    TEXT NOT NULL
+    payload    TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'published',
+    current_version_id TEXT,
+    revision   INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS run_versions (
+    version_id       TEXT PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    seq              INTEGER NOT NULL,
+    status           TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    correction_id    TEXT NOT NULL DEFAULT '',
+    affected_months  TEXT NOT NULL DEFAULT '',
+    payload          TEXT NOT NULL,
+    UNIQUE (run_id, seq)
+);
+CREATE TABLE IF NOT EXISTS correction_batches (
+    correction_id    TEXT PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    applied_at       TEXT NOT NULL DEFAULT '',
+    version_id       TEXT NOT NULL DEFAULT '',
+    affected_months  TEXT NOT NULL DEFAULT '',
+    request_hash     TEXT NOT NULL,
+    payload          TEXT NOT NULL,
+    error            TEXT NOT NULL DEFAULT '',
+    UNIQUE (run_id, correction_id)
 );
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,12 +101,56 @@ def session(db_path: Path | None = None):
     try:
         yield conn
         conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
+RUN_COLUMN_DEFS = {
+    "status": "TEXT NOT NULL DEFAULT 'published'",
+    "current_version_id": "TEXT",
+    "revision": "INTEGER NOT NULL DEFAULT 1",
+    "updated_at": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_runs(conn: sqlite3.Connection) -> None:
+    """老库升级：runs 表补上版本指针列，并把已有的批次快照登记为第 1 版。
+
+    旧批次快照不删除、不改写，登记成版本后仍可原样读取（可恢复）。
+    """
+    columns = _table_columns(conn, "runs")
+    for name, definition in RUN_COLUMN_DEFS.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+    conn.execute("UPDATE runs SET updated_at = created_at WHERE updated_at = ''")
+
+    legacy = conn.execute(
+        "SELECT run_id, created_at, payload FROM runs WHERE current_version_id IS NULL"
+    ).fetchall()
+    for row in legacy:
+        version_id = f"{row['run_id']}-v1"
+        conn.execute(
+            "INSERT OR IGNORE INTO run_versions "
+            "(version_id, run_id, seq, status, created_at, correction_id, affected_months, payload) "
+            "VALUES (?, ?, 1, 'published', ?, '', '', ?)",
+            (version_id, row["run_id"], row["created_at"], row["payload"]),
+        )
+        conn.execute(
+            "UPDATE runs SET current_version_id = ?, revision = 1 WHERE run_id = ?",
+            (version_id, row["run_id"]),
+        )
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate_runs(conn)
     conn.commit()
 
 
@@ -156,9 +228,44 @@ def count_readings(conn: sqlite3.Connection) -> int:
     return int(row["c"])
 
 
+def apply_reading_corrections(conn: sqlite3.Connection, corrections: list[dict], now: str) -> int:
+    """把补录读数并入读数表（同键覆盖、缺键新增）。调用方负责事务边界。"""
+    for row in corrections:
+        conn.execute(
+            "INSERT INTO readings (meter_id, read_at, reading_kwh, kind, imported_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(meter_id, read_at, kind) DO UPDATE SET "
+            "reading_kwh = excluded.reading_kwh, imported_at = excluded.imported_at",
+            (
+                row["meter_id"],
+                row["read_at"].isoformat(),
+                float(row["reading_kwh"]),
+                row["kind"],
+                now,
+            ),
+        )
+    return len(corrections)
+
+
 def reading_span(conn: sqlite3.Connection) -> dict:
     row = conn.execute("SELECT MIN(read_at) AS lo, MAX(read_at) AS hi FROM readings").fetchone()
     return {"date_from": row["lo"], "date_to": row["hi"]}
+
+
+def readings_fingerprint(conn: sqlite3.Connection) -> str:
+    """读数集合指纹（与 publish.fingerprint 同口径），用于校验批次快照是否过期。"""
+    import hashlib
+
+    digest = hashlib.sha256()
+    rows = conn.execute(
+        "SELECT meter_id, read_at, kind, reading_kwh FROM readings "
+        "ORDER BY meter_id, read_at, kind"
+    ).fetchall()
+    for row in rows:
+        digest.update(
+            f"{row['meter_id']}|{row['read_at']}|{row['kind']}|{float(row['reading_kwh']):.1f}\n".encode("utf-8")
+        )
+    return digest.hexdigest()
 
 
 # --------------------------------------------------------------------------- 换表记录
@@ -184,43 +291,188 @@ def count_changes(conn: sqlite3.Connection) -> int:
     return int(row["c"])
 
 
-# --------------------------------------------------------------------------- 还原批次
+# --------------------------------------------------------------------------- 还原批次与版本
 
 
-def save_run(conn: sqlite3.Connection, payload: dict) -> None:
+def save_run(conn: sqlite3.Connection, payload: dict) -> str:
+    """新建批次并写入第 1 版快照，返回 version_id。"""
+    run_id = payload["run_id"]
+    version_id = f"{run_id}-v1"
     conn.execute(
-        "INSERT OR REPLACE INTO runs (run_id, created_at, month, meters, payload) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO runs "
+        "(run_id, created_at, month, meters, payload, status, current_version_id, revision, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, 'published', ?, 1, ?)",
         (
-            payload["run_id"],
+            run_id,
             payload["created_at"],
             payload.get("month") or "",
             ",".join(payload.get("selected") or []),
             json.dumps(payload, ensure_ascii=False),
+            version_id,
+            payload["created_at"],
         ),
     )
+    conn.execute(
+        "INSERT INTO run_versions "
+        "(version_id, run_id, seq, status, created_at, correction_id, affected_months, payload) "
+        "VALUES (?, ?, 1, 'published', ?, '', '', ?)",
+        (version_id, run_id, payload["created_at"], json.dumps(payload, ensure_ascii=False)),
+    )
+    return version_id
+
+
+def _normalize_ledger(ledger: dict) -> dict:
+    """兼容旧快照：旧版 ledger 只存当月 rows 列表，读时统一包成月块。"""
+    if not isinstance(ledger, dict):
+        return {}
+    normalized: dict[str, dict] = {}
+    for month, value in ledger.items():
+        if isinstance(value, list):
+            normalized[month] = {
+                "month": month,
+                "rows": value,
+                "evidence": [],
+                "anomalies": [],
+                "gaps": [],
+                "changes": [],
+                "rollovers": [],
+                "checks": [],
+                "review": [],
+            }
+        else:
+            normalized[month] = value
+    return normalized
+
+
+def _run_payload(row: sqlite3.Row, payload: str | None = None) -> dict:
+    data = json.loads(payload if payload is not None else row["payload"])
+    data["ledger"] = _normalize_ledger(data.get("ledger") or {})
+    data["revision"] = row["revision"] if "revision" in row.keys() else 1
+    data["status"] = row["status"] if "status" in row.keys() else "published"
+    if "current_version_id" in row.keys():
+        data["version_id"] = row["current_version_id"] or data.get("version_id", "")
+    if "updated_at" in row.keys() and row["updated_at"]:
+        data["updated_at"] = row["updated_at"]
+    return data
 
 
 def load_run(conn: sqlite3.Connection, run_id: str) -> dict | None:
-    row = conn.execute("SELECT payload FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-    return json.loads(row["payload"]) if row else None
+    """读取批次当前对外发布的版本（不返回历史版本）。"""
+    row = conn.execute(
+        "SELECT payload, status, revision, current_version_id, updated_at FROM runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    return _run_payload(row) if row else None
+
+
+def load_version_payload(conn: sqlite3.Connection, run_id: str, version_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT payload FROM run_versions WHERE run_id = ? AND version_id = ?",
+        (run_id, version_id),
+    ).fetchone()
+    if not row:
+        return None
+    data = json.loads(row["payload"])
+    data["ledger"] = _normalize_ledger(data.get("ledger") or {})
+    return data
+
+
+def list_run_versions(conn: sqlite3.Connection, run_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT version_id, seq, status, created_at, correction_id, affected_months "
+        "FROM run_versions WHERE run_id = ? ORDER BY seq",
+        (run_id,),
+    ).fetchall()
+    return [
+        {
+            "version_id": row["version_id"],
+            "seq": row["seq"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "correction_id": row["correction_id"],
+            "affected_months": [m for m in row["affected_months"].split(",") if m],
+        }
+        for row in rows
+    ]
+
+
+def version_info(conn: sqlite3.Connection, version_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM run_versions WHERE version_id = ?", (version_id,)
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "version_id": row["version_id"],
+        "run_id": row["run_id"],
+        "seq": row["seq"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "correction_id": row["correction_id"],
+        "affected_months": [m for m in row["affected_months"].split(",") if m],
+    }
+
+
+def next_version_seq(conn: sqlite3.Connection, run_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) AS seq FROM run_versions WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    return int(row["seq"]) + 1
+
+
+def publish_version(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    payload: dict,
+    correction_id: str,
+    affected_months: list[str],
+    now: str,
+) -> dict:
+    """把新版本一次性切换为当前发布版本；旧版本原样保留，随时可回读。"""
+    seq = next_version_seq(conn, run_id)
+    version_id = f"{run_id}-v{seq}"
+    conn.execute(
+        "INSERT INTO run_versions "
+        "(version_id, run_id, seq, status, created_at, correction_id, affected_months, payload) "
+        "VALUES (?, ?, ?, 'published', ?, ?, ?, ?)",
+        (
+            version_id,
+            run_id,
+            seq,
+            now,
+            correction_id,
+            ",".join(affected_months),
+            json.dumps(payload, ensure_ascii=False),
+        ),
+    )
+    conn.execute(
+        "UPDATE runs SET payload = ?, status = 'published', current_version_id = ?, "
+        "revision = ?, updated_at = ? WHERE run_id = ?",
+        (json.dumps(payload, ensure_ascii=False), version_id, seq, now, run_id),
+    )
+    return {"version_id": version_id, "seq": seq}
 
 
 def latest_run(conn: sqlite3.Connection, month: str | None = None) -> dict | None:
     if month:
         row = conn.execute(
-            "SELECT payload FROM runs WHERE month = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            "SELECT payload, status, revision, current_version_id, updated_at FROM runs "
+            "WHERE month = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (month,),
         ).fetchone()
     else:
         row = conn.execute(
-            "SELECT payload FROM runs ORDER BY created_at DESC, rowid DESC LIMIT 1"
+            "SELECT payload, status, revision, current_version_id, updated_at FROM runs "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1"
         ).fetchone()
-    return json.loads(row["payload"]) if row else None
+    return _run_payload(row) if row else None
 
 
 def list_runs(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
     rows = conn.execute(
-        "SELECT run_id, created_at, month, meters FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        "SELECT run_id, created_at, month, meters, status, revision, current_version_id, updated_at "
+        "FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?",
         (limit,),
     ).fetchall()
     return [
@@ -229,9 +481,110 @@ def list_runs(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
             "created_at": row["created_at"],
             "month": row["month"],
             "meters": row["meters"].split(",") if row["meters"] else [],
+            "status": row["status"],
+            "revision": row["revision"],
+            "version_id": row["current_version_id"] or "",
+            "updated_at": row["updated_at"] or row["created_at"],
         }
         for row in rows
     ]
+
+
+# --------------------------------------------------------------------------- 补录/更正批次
+
+
+def save_correction(
+    conn: sqlite3.Connection,
+    *,
+    correction_id: str,
+    run_id: str,
+    status: str,
+    request_hash: str,
+    payload: dict,
+    affected_months: list[str],
+    now: str,
+    error: str = "",
+) -> None:
+    conn.execute(
+        "INSERT INTO correction_batches "
+        "(correction_id, run_id, status, created_at, applied_at, version_id, affected_months, "
+        "request_hash, payload, error) VALUES (?, ?, ?, ?, '', '', ?, ?, ?, ?)",
+        (
+            correction_id,
+            run_id,
+            status,
+            now,
+            ",".join(affected_months),
+            request_hash,
+            json.dumps(payload, ensure_ascii=False),
+            error,
+        ),
+    )
+
+
+def load_correction(conn: sqlite3.Connection, correction_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM correction_batches WHERE correction_id = ?", (correction_id,)
+    ).fetchone()
+    if not row:
+        return None
+    data = json.loads(row["payload"])
+    data.update(
+        {
+            "correction_id": row["correction_id"],
+            "run_id": row["run_id"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "applied_at": row["applied_at"],
+            "version_id": row["version_id"],
+            "affected_months": [m for m in row["affected_months"].split(",") if m],
+            "request_hash": row["request_hash"],
+            "error": row["error"],
+        }
+    )
+    return data
+
+
+def find_correction_by_hash(
+    conn: sqlite3.Connection, run_id: str, request_hash: str
+) -> dict | None:
+    row = conn.execute(
+        "SELECT correction_id FROM correction_batches "
+        "WHERE run_id = ? AND request_hash = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (run_id, request_hash),
+    ).fetchone()
+    return load_correction(conn, row["correction_id"]) if row else None
+
+
+def update_correction(
+    conn: sqlite3.Connection,
+    correction_id: str,
+    *,
+    status: str,
+    applied_at: str = "",
+    version_id: str = "",
+    error: str = "",
+) -> None:
+    conn.execute(
+        "UPDATE correction_batches SET status = ?, applied_at = ?, version_id = ?, error = ? "
+        "WHERE correction_id = ?",
+        (status, applied_at, version_id, error, correction_id),
+    )
+
+
+def list_corrections(conn: sqlite3.Connection, run_id: str | None = None, limit: int = 20) -> list[dict]:
+    if run_id:
+        rows = conn.execute(
+            "SELECT correction_id FROM correction_batches WHERE run_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (run_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT correction_id FROM correction_batches ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [load_correction(conn, row["correction_id"]) for row in rows]
 
 
 # --------------------------------------------------------------------------- 事件 / 元数据

@@ -12,6 +12,8 @@
 - **月度分摊**：区间跨月按天数比例分摊，保留 2 位小数，用最大余数法保证分摊合计与区间用量**完全相等**。
 - **分时校验**：`peak + valley ≈ total`，容差 0.5%，超差记异常但仍输出数值。
 - **复核清单**：月度台账（每表每月 total/peak/valley/缺口天数/异常数）+ P1/P2/P3 复核项 + CSV 导出。
+- **补录 / 迟到更正**：对已发布批次补录读数，整批先校验，只重算受影响月份，通过后一次性切换新版本；
+  旧版本快照保留可回读，页面/台账/下载始终读同一版；同一批重复提交不新增结果。
 
 ## 核心规则
 
@@ -26,6 +28,15 @@
 3. **分时一致性**：`|peak + valley − total| ≤ 0.5% × total`，超差进复核清单，数值照常输出。
 4. **缺口**：相邻读数间隔 > 31 天 → `gap`，输出缺口区间、缺失天数、建议抄表日（区间中点），**禁止插值**。
 5. **汇总**：每表每月 total/peak/valley/缺口天数/异常数（异常数 = 隔离异常 + 分时超差）+ 复核清单。
+6. **补录 / 迟到更正**：
+   - 补录按 `(表号, 日期, 电量类型)` **覆盖**原读数（缺则新增），不是替换整份文件；
+   - 整批做字段级校验（表号/日期真实性/数值/类型/批内重复），任一条不合法 → 整批拒绝，读数与批次均不动；
+   - 只重算更正点两侧区间覆盖到的月份（`受影响月份`），其余月份沿用旧版本快照；
+   - 新版本在**单个事务**内切换：读数落库 + 新版本写入 + 发布指针更新 + 更正批次状态一次提交。
+     中途失败时 `runs.current_version_id` 不变，页面/台账/下载继续读旧版本；
+   - 同一 `(批次, 内容)` 重复提交按内容指纹命中原批次，返回同一 `version_id`，不新增结果；
+   - 旧版本快照保留在 `run_versions`，可通过 `/api/runs/{run_id}/versions/{version_id}` 回读，
+     旧批次不会因覆盖而无法恢复。
 
 ## 启动
 
@@ -58,6 +69,16 @@ curl -s -X POST http://127.0.0.1:18217/api/restore \
   -H 'Content-Type: application/json' -d '{"month":"2026-03"}' | python3 -m json.tool | head -40
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18217/api/restore \
   -H 'Content-Type: application/json' -d '{"month":"2026-03","meter_ids":["EM-99"]}'   # 400
+
+# 补录 / 迟到更正：整批校验 → 只重算受影响月份 → 原子发布新版本
+RUN_ID=$(curl -s -X POST http://127.0.0.1:18217/api/restore \
+  -H 'Content-Type: application/json' -d '{"month":"2026-03"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["run_id"])')
+curl -s -X POST "http://127.0.0.1:18217/api/runs/$RUN_ID/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"readings":[{"meter_id":"EM-01","read_at":"2026-03-29","reading_kwh":9700.0,"kind":"total"}]}'
+# 重复提交同一批：idempotent=true，version_id 不变
+# 任一读数不合法：400 + problems，整批不落库，旧版本继续发布
+curl -s http://127.0.0.1:18217/api/runs/$RUN_ID/versions   # 历史版本（旧快照可回读）
 ```
 
 ## API / 页面
@@ -66,18 +87,22 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18217/api/rest
 | --- | --- | --- |
 | GET | `/health` | 健康检查 + 读数行数/表数 |
 | GET | `/` | 首页：场景、输入契约、样例概览、演示步骤 |
-| GET | `/workbench` | 工作台：选表选月份、导入读数、执行还原（带进度） |
+| GET | `/workbench` | 工作台：选表选月份、导入读数、执行还原、补录更正（带进度） |
 | GET | `/result/{run_id}` | 结果页：月度用能表、分摊依据、缺口、隔离异常、复核清单 |
 | GET | `/review` | 月度台账（全期）+ 复核清单 + 导出 |
 | POST | `/api/import` | multipart 上传读数 CSV（UTF-8/GBK），严格校验，整体替换 |
 | POST | `/api/import/sample` | 重新导入样例（幂等） |
 | POST | `/api/restore` | `{month, meter_ids?, full_scale?, max_gap_days?}` → 201 + run_id + 台账 + 依据 |
-| GET | `/api/runs`, `/api/runs/{run_id}` | 批次列表 / 批次详情 |
-| GET | `/api/runs/{run_id}/ledger.csv`、`/api/runs/{run_id}/review.csv` | 本月台账 / 复核清单 CSV |
-| GET | `/api/ledger.csv`、`/api/review.csv` | 全期台账 / 复核清单 CSV |
+| POST | `/api/runs/{run_id}/corrections` | `{readings:[{meter_id,read_at,reading_kwh,kind}]}` → 整批校验 + 只重算受影响月份 + 原子发布新版本；同批重复提交返回同一版本 |
+| GET | `/api/runs/{run_id}/versions`、`/api/runs/{run_id}/versions/{version_id}` | 批次版本列表 / 指定版本快照（旧版可回读） |
+| GET | `/api/runs/{run_id}/corrections` | 该批次的补录记录（pending / applied / failed） |
+| GET | `/api/runs`, `/api/runs/{run_id}` | 批次列表 / 批次当前发布版本详情 |
+| GET | `/api/runs/{run_id}/ledger.csv`、`/api/runs/{run_id}/review.csv` | 本月台账 / 复核清单 CSV（读当前发布版本） |
+| GET | `/api/ledger.csv`、`/api/review.csv` | 全期台账 / 复核清单 CSV（读当前发布版本） |
 
 错误输入返回 4xx 且带中文原因：未知表号（400 + 可选表号列表）、月份格式错误（400）、
-该月无读数覆盖（400）、量程非正（400）、缺口阈值 < 2（400）、CSV 行级错误（400 + 逐行问题）。
+该月无读数覆盖（400）、量程非正（400）、缺口阈值 < 2（400）、CSV 行级错误（400 + 逐行问题）；
+补录批次错误返回 400 + 逐条 `problems`，批次不存在 404，发布失败 500 且旧版本保持不变。
 
 ## 目录
 
@@ -90,8 +115,10 @@ app/
   proration.py     # 跨月按天分摊（最大余数法守恒）
   validation.py    # 峰谷容差、缺口月份重叠、覆盖说明
   summary.py       # 月度台账、复核清单、CSV 导出
-  pipeline.py      # 编排：一次还原 → 全月份汇总 + 指定月份聚焦
-  store.py         # SQLite（读数/换表/台账/批次/事件）
+  pipeline.py      # 编排：一次还原 → 全月份汇总 + 指定月份聚焦 + 只重算受影响月份
+  corrections.py   # 补录批次校验、受影响月份计算、内容指纹
+  publish.py       # 补录发布：合并受影响月份 → 原子切换版本 → 幂等重试
+  store.py         # SQLite（读数/换表/台账/批次/版本/更正批次/事件）
   seed.py          # 幂等 seed
   templates/       # base/index/workbench/result/review
   static/          # app.js, style.css（原生 JS/CSS，无框架无 CDN）
@@ -99,7 +126,7 @@ sample_data/
   readings.csv         # 4 块表 × 每日读数 × 12 个月（total/peak/valley）= 4140 行
   meter_changes.json   # 换表记录（旧表号/新表号/换表日/拆表读数/装表读数，按类型分开）
   meters.json          # 表计台账（名称/位置/量程）
-tests/                 # test_restore / test_proration / test_validation / test_api
+tests/                 # test_restore / test_proration / test_validation / test_api / test_corrections
 ```
 
 样例数据里刻意埋了：1 次换表（EM-02 2025-09-15）、1 次满量程回绕（EM-03 2025-12-17）、
@@ -113,3 +140,5 @@ tests/                 # test_restore / test_proration / test_validation / test_
 - 缺口期间没有读数，系统不做任何插值；缺口越大，该月日均值参考意义越小。
 - 表计倍率（CT 变比）在台账里只登记不参与换算（样例倍率均为 1.0）。
 - 单租户单进程演示：无登录、无权限、无并发写保护，SQLite 为本地文件。
+- 补录只增量覆盖 `(表号, 日期, 电量类型)`；整份读数文件导入仍会替换全部读数并使旧批次快照失效
+  （页面回退为该份读数的实时计算，需重新执行还原才会生成新的可补录批次）。

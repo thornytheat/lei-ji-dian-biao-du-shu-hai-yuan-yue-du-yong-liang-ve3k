@@ -283,6 +283,29 @@ def build_ledger(
     return {"months": ledger_months, "review": review, "stats": stats, "monitored": monitored}
 
 
+def recompute_stats(ledger_months: dict[str, dict], review: list[dict], meters: int) -> dict:
+    """按合并后的月块重算汇总统计（用于补录只替换受影响月份后的全量口径）。"""
+    ordered = [ledger_months[month] for month in sorted(ledger_months)]
+    return {
+        "months": len(ordered),
+        "meters": meters,
+        "intervals": sum(len(block["evidence"]) for block in ordered),
+        "usage_total": round(
+            sum((row["total"] or 0.0) for block in ordered for row in block["rows"]), 2
+        ),
+        "review_items": len(review),
+        "review_p1": sum(1 for item in review if item["level"] == "P1"),
+        "review_p2": sum(1 for item in review if item["level"] == "P2"),
+        "review_p3": sum(1 for item in review if item["level"] == "P3"),
+        "isolated_anomalies": sum(
+            row["isolated_count"] for block in ordered for row in block["rows"]
+        ),
+        "gaps": sum(len(block["gaps"]) for block in ordered),
+        "meter_changes": sum(len(block["changes"]) for block in ordered),
+        "rollovers": sum(len(block["rollovers"]) for block in ordered),
+    }
+
+
 def _review_items(block: dict, month: str) -> list[dict]:
     items: list[dict] = []
     for check in block["checks"]:

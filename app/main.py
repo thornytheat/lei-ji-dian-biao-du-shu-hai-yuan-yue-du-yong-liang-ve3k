@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import pipeline, proration, readings, seed, settings, store, summary
+from . import corrections, pipeline, proration, publish, readings, seed, settings, store, summary
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
@@ -67,7 +67,29 @@ def cache_key(rows: list[dict], meters: list[dict], changes: list[dict]) -> str:
 
 
 def analyze_all(force: bool = False) -> dict:
-    """全量还原一次并缓存（导入后 force=True 失效缓存）。"""
+    """全期结果：优先读当前发布版本快照，没有可用批次时回退实时计算。
+
+    页面、台账导出与批次下载都走同一个发布版本，避免「结果页新值、台账旧值」。
+    """
+    with store.session() as conn:
+        store.init_schema(conn)
+        view = publish.published_view(conn)
+    if view is not None:
+        months = view["month_order"] or sorted(view["months"])
+        return {
+            "months": view["months"],
+            "month_order": months,
+            "review": view["review"],
+            "stats": view["stats"],
+            "monitored": view["monitored"],
+            "selected": view["run"].get("selected") or [],
+            "available": view["run"].get("available") or [],
+            "full_scale": view["run"].get("full_scale"),
+            "max_gap_days": view["run"].get("max_gap_days"),
+            "tou_tolerance": view["run"].get("tou_tolerance"),
+            "run": view["run"],
+        }
+
     rows, meters, changes = load_data()
     key = cache_key(rows, meters, changes)
     if not force and _CACHE["key"] == key and _CACHE["value"] is not None:
@@ -263,6 +285,7 @@ def api_import_sample() -> JSONResponse:
         store.init_schema(conn)
         sample = seed.load_sample_files()
         result = seed.seed(conn, sample=sample, force=True)
+        store.set_meta(conn, "current_run_id", "")
         counts = {
             "readings": store.count_readings(conn),
             "meters": len(store.all_meters(conn)),
@@ -318,6 +341,8 @@ async def api_import(file: UploadFile = File(...)) -> JSONResponse:
         ]
         if new_meters:
             store.upsert_meters(conn, new_meters)
+        # 整份读数被替换后，已有批次快照不再对应当前读数，后续页面回退实时计算。
+        store.set_meta(conn, "current_run_id", "")
         store.add_event(
             conn,
             "import",
@@ -385,21 +410,26 @@ def api_restore(payload: RestoreRequest = Body(...)) -> JSONResponse:
         "max_gap_days": result["max_gap_days"],
         "tou_tolerance": result["tou_tolerance"],
         "focus": focus,
-        "review": focus["review"],
-        "ledger": {month: result["months"][month]["rows"] for month in result["month_order"]},
+        "review": result["review"],
+        "focus_review": focus["review"],
+        "ledger": {month: result["months"][month] for month in result["month_order"]},
         "month_order": result["month_order"],
         "stats": result["stats"],
         "monitored": result["monitored"],
+        "data_version": publish.fingerprint(rows),
+        "recomputed_months": list(result["month_order"]),
     }
     with store.session() as conn:
         store.init_schema(conn)
-        store.save_run(conn, run_payload)
+        version_id = store.save_run(conn, run_payload)
+        store.set_meta(conn, "current_run_id", run_id)
         store.add_event(
             conn,
             "restore",
             f"还原 {payload.month}：{len(focus['rows'])} 块表，总用量 {focus['totals']['usage_total']:g} kWh",
             {
                 "run_id": run_id,
+                "version_id": version_id,
                 "month": payload.month,
                 "meters": result["selected"],
                 "totals": focus["totals"],
@@ -412,6 +442,8 @@ def api_restore(payload: RestoreRequest = Body(...)) -> JSONResponse:
         content={
             "ok": True,
             "run_id": run_id,
+            "version_id": version_id,
+            "revision": 1,
             "month": payload.month,
             "meters": result["selected"],
             "totals": focus["totals"],
@@ -476,6 +508,71 @@ def api_run(run_id: str) -> dict:
     return {"ok": True, "run": run}
 
 
+# --------------------------------------------------------------------------- 补录 / 迟到更正
+
+
+@app.post("/api/runs/{run_id}/corrections")
+@app.post("/api/runs/{run_id}/supplement")
+@app.post("/api/runs/{run_id}/amend")
+def api_create_correction(run_id: str, payload: Any = Body(...)) -> JSONResponse:
+    """补录/迟到更正：整批校验 → 只重算受影响月份 → 原子发布新版本。
+
+    同一批内容重复提交返回同一个 correction_id/version_id，不新增结果。
+    任一读数不合法或重算失败时，旧版本继续对外发布。
+    """
+    if isinstance(payload, list):
+        rows = payload
+    else:
+        rows = corrections.extract_rows(payload or {})
+    try:
+        result = publish.apply_correction(run_id, rows)
+    except publish.CorrectionError as exc:
+        status = exc.status
+        if exc.details:
+            problems = exc.details
+            detail = f"{exc.message}（{problems[0].get('message', '')}）"
+        else:
+            problems = []
+            detail = exc.message
+        return JSONResponse(
+            status_code=status,
+            content={"ok": False, "error": exc.message, "detail": detail, "problems": problems},
+        )
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.get("/api/runs/{run_id}/versions")
+def api_run_versions(run_id: str) -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        run = store.load_run(conn, run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail=f"还原批次 {run_id} 不存在")
+        versions = store.list_run_versions(conn, run_id)
+    return {"ok": True, "run_id": run_id, "current_version_id": run.get("version_id", ""), "versions": versions}
+
+
+@app.get("/api/runs/{run_id}/versions/{version_id}")
+def api_run_version(run_id: str, version_id: str) -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        payload = store.load_version_payload(conn, run_id, version_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail=f"版本 {version_id} 不存在")
+    return {"ok": True, "run_id": run_id, "version_id": version_id, "run": payload}
+
+
+@app.get("/api/runs/{run_id}/corrections")
+def api_run_corrections(run_id: str) -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        run = store.load_run(conn, run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail=f"还原批次 {run_id} 不存在")
+        items = store.list_corrections(conn, run_id, limit=30)
+    return {"ok": True, "run_id": run_id, "corrections": items}
+
+
 # --------------------------------------------------------------------------- 导出
 
 
@@ -495,8 +592,13 @@ def api_run_ledger(run_id: str) -> Response:
     if not run:
         raise HTTPException(status_code=404, detail=f"还原批次 {run_id} 不存在")
     month = run["month"]
+    block = (run.get("ledger") or {}).get(month)
+    if block is None and run.get("focus"):
+        block = run["focus"]
+    if block is None:
+        raise HTTPException(status_code=404, detail=f"批次 {run_id} 缺少 {month} 台账")
     return _csv_response(
-        summary.ledger_csv({month: run["focus"]}),
+        summary.ledger_csv({month: block}),
         f"metercalc-ledger-{month}.csv",
     )
 
@@ -508,7 +610,11 @@ def api_run_review(run_id: str) -> Response:
         run = store.load_run(conn, run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"还原批次 {run_id} 不存在")
-    return _csv_response(summary.review_csv(run["review"]), f"metercalc-review-{run['month']}.csv")
+    month = run.get("month") or ""
+    items = run.get("focus_review")
+    if items is None:
+        items = [item for item in (run.get("review") or []) if item.get("month") == month]
+    return _csv_response(summary.review_csv(items), f"metercalc-review-{month}.csv")
 
 
 @app.get("/api/ledger.csv")
